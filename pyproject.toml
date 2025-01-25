@@ -1,0 +1,10 @@
+[project]
+name = "workflow-compiler"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datamodel-code-generator>=0.26.4",
+    "google-cloud-workflows>=1.16.0",
+]
