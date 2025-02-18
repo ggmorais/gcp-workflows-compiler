@@ -1,9 +1,19 @@
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
-from typing import Any, Literal, TypedDict, Union
+from typing import Any, Literal, TypedDict
 
 import yaml
 from google.cloud import workflows
+
+
+def callable_node_dict(node: "Node"):
+    return {
+        f"call_node_{node.id}": {
+            "call": str(node.task),
+            "result": f"{node.id}_results",
+            "args": node.task.args
+        }
+    }
 
 
 @dataclass
@@ -35,10 +45,6 @@ class LogTask(BaseTask):
     args: LogTaskArgs
     name: str = "sys.log"
 
-    def __post_init__(self):
-        if "{{" in self.args["text"]:
-            self.args["text"] = self.args["text"].replace("{{", "${").replace("}}", "}")
-
 
 class HttpTaskArgs(TypedDict):
     url: str
@@ -55,9 +61,117 @@ class HttpTask(BaseTask):
 
 
 @dataclass
+class ForLoopTask:
+    nodes: list["Node"]
+    key: str
+    iterable: list[Any]
+    parallel: int = 1
+
+
+@dataclass
+class SetVariablesTask:
+    data: dict
+
+
+dtypes_list = str | int | float | bool | list | dict
+
+
+@dataclass
+class Param:
+    value: None
+    dtype: dtypes_list
+    name: str
+
+    def __post_init__(self):
+        if not isinstance(self.value, self.dtype | None):
+            raise Exception(f"'{self.value}' is not of type {self.dtype}")
+
+
+@dataclass
+class Variable:
+    value: None
+    dtype: dtypes_list
+    name: str
+
+    def __post_init__(self):
+        if not isinstance(self.value, self.dtype | None):
+            raise Exception(f"'{self.value}' is not of type {self.dtype}")
+
+    # def set_value(self):
+    #     return {
+    #         f"assign"
+    #     }
+
+
+@dataclass
 class Node:
     id: str
-    task: Union[SleepTask]
+    task: SleepTask | LogTask | HttpTask | ForLoopTask | SetVariablesTask  # | AppendVariableTask
+
+    def get_as_dict(self):
+        if isinstance(self.task, BaseTask):
+            return {
+                f"execute_{self.id}": {
+                    "try": {
+                        "steps": [
+                            {
+                                f"call_node_{self.id}": {
+                                    "call": str(self.task),
+                                    "result": f"{self.id}_results",
+                                    "args": self.task.args
+                                }
+                            },
+                            {
+                                f"assign_success_node_{self.id}": {
+                                    "assign": [
+                                        {f"results[\"{self.id}\"]": {}},
+                                        {f"results[\"{self.id}\"].status": "SUCCESS"},
+                                        {f"results[\"{self.id}\"].output": f"${{{self.id}_results}}"}
+                                    ]
+                                }
+
+                            }
+                        ]
+                    },
+                    "except": {
+                        "as": "e",
+                        "steps": [
+                            {
+                                f"assign_error_node_{self.id}": {
+                                    "assign": [
+                                        {f"results[\"{self.id}\"]": {}},
+                                        {f"results[\"{self.id}\"].status": "FAILURE"},
+                                        {f"results[\"{self.id}\"].output": "${e}"}
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        elif isinstance(self.task, ForLoopTask):
+            fix_var_name = f"${{{self.task.iterable}}}" if type(self.task.iterable) is str else self.task.iterable
+
+            return {
+                f"loop_{self.id}": {
+                    "parallel": {
+                        "shared": ["results"],
+                        "for": {
+                            "value": self.task.key,
+                            "in": fix_var_name,
+                            "steps": [node.get_as_dict() for node in self.task.nodes]
+                        }
+                    }
+                }
+            }
+        elif isinstance(self.task, SetVariablesTask):
+            return {
+                f"set_variables_{self.id}": {
+                    "assign": [
+                        {f'variables["${k}"]': v} for k, v in self.task.data.items()
+                    ]
+                }
+            }
 
 
 @dataclass
@@ -71,6 +185,8 @@ class Edge:
 class WorkflowData:
     nodes: list[Node]
     edges: list[Edge]
+    params: list[Param]
+    variables: list[Variable]
 
 
 def compile_to_workflows(data: WorkflowData) -> dict:
@@ -79,9 +195,17 @@ def compile_to_workflows(data: WorkflowData) -> dict:
         "params": ["args"],
         "steps": [{
             "init": {
-                "assign": [{
-                    "node_results": {}
-                }]
+                "assign": [
+                    {
+                        "results": {},
+                    },
+                    {
+                        "variables": {var.name: var.value for var in data.variables},
+                    },
+                    {
+                        "params": {var.name: var.value for var in data.params},
+                    }
+                ]
             }
         }]
     }
@@ -92,56 +216,15 @@ def compile_to_workflows(data: WorkflowData) -> dict:
         if not any(edge.target == node.id for edge in data.edges)
     ]
 
-    def new_step(node: Node) -> dict:
-        return {
-            f"execute_{node.id}": {
-                "try": {
-                    "steps": [
-                        {
-                            f"call_node_{node.id}": {
-                                "call": str(node.task),
-                                "result": f"{node.id}_results",
-                                "args": node.task.args
-                            }
-                        },
-                        {
-                            f"assign_success_node_{node.id}": {
-                                "assign": [
-                                    {f"node_results[\"{node.id}\"]": {}},
-                                    {f"node_results[\"{node.id}\"].status": "SUCCESS"},
-                                    {f"node_results[\"{node.id}\"].output": f"${{{node.id}_results}}"}
-                                ]
-                            }
-
-                        }
-                    ]
-                },
-                "except": {
-                    "as": "e",
-                    "steps": [
-                        {
-                            f"assign_error_node_{node.id}": {
-                                "assign": [
-                                    {f"node_results[\"{node.id}\"]": {}},
-                                    {f"node_results[\"{node.id}\"].status": "FAILURE"},
-                                    {f"node_results[\"{node.id}\"].output": "${e}"}
-                                ]
-                            }
-                        }
-                    ]
-                }
-            }
-        }
-
     # Add initial nodes to the workflow as parallel branches, if multiple
     if len(initial_nodes) > 1:
         workflow["steps"].append({"run_initial_nodes": {
             "parallel": {
-                "shared": ["node_results"],
+                "shared": ["results"],
                 "branches": [
                     {
                         f"branch_{node.id}": {
-                            "steps": [new_step(node)]
+                            "steps": [node.get_as_dict()]
                         }
                     }
                     for node in initial_nodes
@@ -149,18 +232,18 @@ def compile_to_workflows(data: WorkflowData) -> dict:
             }
         }})
     else:
-        workflow["steps"].append(new_step(initial_nodes[0]))
+        workflow["steps"].append(initial_nodes[0].get_as_dict())
 
     def create_switch_condition(node: Node, edges: list[Edge], embedded: bool = True):
         conditions = {
             "condition": "${" + " and ".join([
-                f"node_results[\"{edge.source}\"].status == \"{edge.condition}\""
+                f"results[\"{edge.source}\"].status == \"{edge.condition}\""
                 for edge in edges
             ]) + "}",
         }
 
         if embedded:
-            conditions["steps"] = [new_step(node)]
+            conditions["steps"] = [node.get_as_dict()]
         else:
             conditions["next"] = f"branch_{node.id}"
 
@@ -177,22 +260,12 @@ def compile_to_workflows(data: WorkflowData) -> dict:
         # If there is any edge
         if any(edges):
             workflow["steps"].append(create_switch_condition(node, edges, embedded=True))
-            # workflow["steps"].append({
-            #     f"branch_{node.id}": {
-            #         "steps": [new_step(node)]
-            #     }
-            # })
-
-    # Add nodes with incoming edges
-    # for node in data.nodes:
-    #     if any(edge.target == node.id for edge in data.edges):
-    #         workflow["steps"].append(new_step(node))
 
     # Add pipeline end step
     workflow["steps"].append({
         "workflow_end": {
             "return": {
-                "node_results": "${node_results}"
+                "results": "${results}"
             }
         }
     })
@@ -203,42 +276,42 @@ def compile_to_workflows(data: WorkflowData) -> dict:
 
 
 def main():
-    # data = WorkflowData(
-    #     nodes=[
-    #         Node(id="n1", type="sleep-task", config=SleepTaskConfig(seconds=1)),
-    #         Node(id="n2", type="sleep-task", config=SleepTaskConfig(seconds=1)),
-    #         Node(id="n3", type="sleep-task", config=SleepTaskConfig(seconds=1)),
-
-    #         Node(id="n4", type="sleep-task", config=SleepTaskConfig(seconds=1)),
-    #         Node(id="n5", type="sleep-task", config=SleepTaskConfig(seconds=1)),
-    #         Node(id="n6", type="sleep-task", config=SleepTaskConfig(seconds="aaa")),
-    #         Node(id="n7", type="sleep-task", config=SleepTaskConfig(seconds=1)),
-    #         Node(id="n8", type="sleep-task", config=SleepTaskConfig(seconds=1))
-    #     ],
-    #     edges=[
-    #         Edge(source="n1", target="n3", condition="SUCCESS"),
-    #         Edge(source="n2", target="n3", condition="SUCCESS"),
-
-    #         Edge(source="n4", target="n5", condition="SUCCESS"),
-    #         Edge(source="n5", target="n6", condition="SUCCESS"),
-    #         Edge(source="n5", target="n7", condition="SUCCESS"),
-    #         Edge(source="n6", target="n8", condition="FAILURE"),
-    #         Edge(source="n7", target="n8", condition="SUCCESS")
-    #     ],
-    # )
     data = WorkflowData(
         nodes=[
-            # Node(id="n1", task=SleepTask(args={"seconds": 1})),
             Node(id="n1", task=HttpTask(args={
                 "method": "GET",
                 "url": "https://google.com",
             })),
 
-            Node(id="n2", task=LogTask(args={"text": "{{ n1.output.code }}"})),
+            Node(id="n2", task=LogTask(args={"text": "ok"})),
+            Node(
+                id="l1", task=ForLoopTask(
+                    key="my_key",
+                    iterable=[1, 2, 3],
+                    nodes=[
+                        Node(id="l1_n1", task=SleepTask(args={"seconds": 1})),
+                        Node(id="set_my_var", task=SetVariablesTask({"my_var": "ok", "my_var_2": "ok2"}))
+                    ]
+                )
+            )
         ],
         edges=[
             Edge(source="n1", target="n2", condition="SUCCESS")
         ],
+        variables=[
+            Variable(
+                value=None,
+                dtype=str,
+                name="my_var"
+            )
+        ],
+        params=[
+            Param(
+                value=None,
+                dtype=str,
+                name="my_param"
+            )
+        ]
     )
 
     with open("compilated.yaml", "w") as f:
